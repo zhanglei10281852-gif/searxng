@@ -53,6 +53,7 @@ from ._helpers import (
 )
 
 from . import config
+from . import failover
 from . import valkeydb
 
 TOKEN_LIVE_TIME = 600
@@ -76,15 +77,18 @@ def is_suspicious(network: IPv4Network | IPv6Network, request: flask.Request, re
     ``renew`` is ``True`` the expire time of this ping is reset to
     :py:obj:`PING_LIVE_TIME`.
 
+    A ping that can not be read from the database (e.g. the Valkey connection
+    is down) is never mistaken as valid: the request is evaluated as
+    suspicious.
+
     """
-    valkey_client = valkeydb.get_valkey_client()
     ping_key = get_ping_key(network, request)
-    if not valkey_client.get(ping_key):
+    if not failover.get(ping_key):
         logger.info("missing ping (IP: %s) / request: %s", network.compressed, ping_key)
         return True
 
     if renew:
-        valkey_client.set(ping_key, 1, ex=PING_LIVE_TIME)
+        failover.set(ping_key, 1, ex=PING_LIVE_TIME)
 
     logger.debug("found ping for (client) network %s -> %s", network.compressed, ping_key)
     return False
@@ -95,8 +99,17 @@ def ping(request: flask.Request, token: str):
     ``token`` is valid a :py:obj:`PING_KEY` for the client is stored in the DB.
     The expire time of this ping-key is :py:obj:`PING_LIVE_TIME`.
 
+    Without a database connection or while the connection is down this
+    function does nothing: a token can not be validated and a ping can never
+    be stored from the local failover window.
+
     """
-    valkey_client = valkeydb.get_valkey_client()
+    try:
+        valkeydb.get_valkey_client()
+    except ValueError:
+        # limiter is inactive / no valkey DB (see get_token)
+        return
+
     cfg = config.get_global_cfg()
 
     if not token_is_valid(token):
@@ -109,7 +122,7 @@ def ping(request: flask.Request, token: str):
     logger.debug(
         "store ping_key for (client) network %s (IP %s) -> %s", network.compressed, real_ip.compressed, ping_key
     )
-    valkey_client.set(ping_key, 1, ex=PING_LIVE_TIME)
+    failover.set(ping_key, 1, ex=PING_LIVE_TIME)
 
 
 def get_ping_key(network: IPv4Network | IPv6Network, request: flask.Request) -> str:
@@ -126,31 +139,41 @@ def get_ping_key(network: IPv4Network | IPv6Network, request: flask.Request) -> 
 
 
 def token_is_valid(token) -> bool:
-    valid = token == get_token()
+    """Returns ``True`` only if ``token`` equals the token currently stored in
+    the database.  When the token can not be read from the database (no
+    connection / Valkey down) ``False`` is returned, a guessed or placeholder
+    token can not validate a ping."""
+    stored = failover.get(TOKEN_KEY)
+    valid = stored is not None and token == stored.decode('UTF-8')
     logger.debug("token is valid --> %s", valid)
     return valid
 
 
 def get_token() -> str:
     """Returns current token.  If there is no currently active token a new token
-    is generated randomly and stored in the Valkey DB.  Without without a
-    database connection, string "12345678" is returned.
+    is generated randomly and stored in the Valkey DB.  Without a database
+    connection, or when the token can not be read or written because the
+    connection to Valkey is down, the placeholder string "12345678" is
+    returned, so rendering of the pages never fails.
 
     - :py:obj:`TOKEN_LIVE_TIME`
     - :py:obj:`TOKEN_KEY`
 
     """
     try:
-        valkey_client = valkeydb.get_valkey_client()
+        valkeydb.get_valkey_client()
     except ValueError:
         # This function is also called when limiter is inactive / no valkey DB
         # (see render function in webapp.py)
         return '12345678'
 
-    token = valkey_client.get(TOKEN_KEY)
+    token = failover.get(TOKEN_KEY)
     if token:
         token = token.decode('UTF-8')  # type: ignore
     else:
         token = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
-        valkey_client.set(TOKEN_KEY, token, ex=TOKEN_LIVE_TIME)
+        if not failover.set(TOKEN_KEY, token, ex=TOKEN_LIVE_TIME):
+            # Valkey is unavailable: the pages must keep rendering, the
+            # placeholder can not validate a ping (see token_is_valid)
+            return '12345678'
     return token

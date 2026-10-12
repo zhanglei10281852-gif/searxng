@@ -27,6 +27,9 @@ Rate limit
 .. automodule:: searx.botdetection.link_token
   :members:
 
+.. automodule:: searx.botdetection.failover
+  :members:
+
 
 .. _botdetection probe headers:
 
